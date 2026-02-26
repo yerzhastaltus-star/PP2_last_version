@@ -2,7 +2,7 @@
 # Import built-in json module to work with JSON files
 import json
 # Open the JSON file and load its content into a Python dictionary
-with open("Practice4/sample-data.json") as f:
+with open("sample-data.json") as f:
     data = json.load(f)
 
 # Print table header formatting
