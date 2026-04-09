@@ -3,6 +3,6 @@ def config():
         "host": "localhost",
         "database": "phonebook_db",
         "user": "postgres",
-        "password": "12345678",
+        "password": "11111",
         "port": 5432
     }
