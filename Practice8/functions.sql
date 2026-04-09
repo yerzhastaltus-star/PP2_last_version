@@ -22,8 +22,12 @@ END;
 $$ LANGUAGE plpgsql;
 
 
--- 2. Pagination function
-CREATE OR REPLACE FUNCTION get_contacts_paginated(limit_count INT, offset_count INT)
+DROP FUNCTION IF EXISTS get_contacts_paginated(INT, INT);
+
+CREATE OR REPLACE FUNCTION get_contacts_paginated(
+    limit_count INT,
+    offset_count INT
+)
 RETURNS TABLE (
     contact_id INT,
     first_name VARCHAR,
@@ -39,3 +43,5 @@ BEGIN
     LIMIT limit_count OFFSET offset_count;
 END;
 $$ LANGUAGE plpgsql;
+
+SELECT * FROM get_contacts_paginated(100, 0);
