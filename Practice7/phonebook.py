@@ -17,8 +17,7 @@ try:
             """)
 except Exception as error:
     print(error)
-finally:
-    conn.close()
+
 
 #inserting data from a csv file
 def import_csv():
@@ -125,4 +124,4 @@ while True:
         info = input("input info: ")
         deleting(info, which_column)
     elif command == "6":
-        break;
+        break
