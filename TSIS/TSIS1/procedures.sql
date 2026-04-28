@@ -1,130 +1,104 @@
--- ============================================================
--- procedures.sql  –  New PL/pgSQL objects for TSIS 1
--- (Procedures from Practice 8 are NOT repeated here.)
--- ============================================================
 
--- 1. add_phone ────────────────────────────────────────────────
---    Adds a phone number to an existing contact looked up by name.
+-- procedures.sql (исправленный)
+
+-- 1. Extended search function (matches name, email, or any phone number)
+CREATE OR REPLACE FUNCTION search_contacts(p_query TEXT)
+RETURNS TABLE(
+    id          INTEGER,
+    name        VARCHAR,
+    email       VARCHAR,
+    birthday    DATE,
+    group_name  VARCHAR,
+    phones      VARCHAR[],   -- изменено с TEXT[]
+    created_at  TIMESTAMP
+) LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY
+    SELECT c.id, c.name, c.email, c.birthday, g.name AS group_name,
+           ARRAY_AGG(DISTINCT p.phone) FILTER (WHERE p.phone IS NOT NULL) AS phones,
+           c.created_at
+    FROM contacts c
+    LEFT JOIN groups g ON c.group_id = g.id
+    LEFT JOIN phones p ON c.id = p.contact_id
+    WHERE c.name ILIKE '%' || p_query || '%'
+       OR c.email ILIKE '%' || p_query || '%'
+       OR p.phone ILIKE '%' || p_query || '%'
+    GROUP BY c.id, g.name, c.created_at
+    ORDER BY c.name;
+END;
+$$;
+
+-- 2. Add phone to an existing contact (by name) – без изменений
 CREATE OR REPLACE PROCEDURE add_phone(
     p_contact_name VARCHAR,
     p_phone        VARCHAR,
-    p_type         VARCHAR DEFAULT 'mobile'
-)
-LANGUAGE plpgsql AS $$
+    p_type         VARCHAR
+) LANGUAGE plpgsql AS $$
 DECLARE
     v_contact_id INTEGER;
 BEGIN
-    -- Resolve contact by first_name (or "first last" composite)
-    SELECT id INTO v_contact_id
-    FROM contacts
-    WHERE LOWER(first_name || COALESCE(' ' || last_name, '')) = LOWER(TRIM(p_contact_name))
-       OR LOWER(first_name) = LOWER(TRIM(p_contact_name))
-    LIMIT 1;
-
-    IF v_contact_id IS NULL THEN
-        RAISE EXCEPTION 'Contact "%" not found.', p_contact_name;
+    SELECT id INTO v_contact_id FROM contacts WHERE name = p_contact_name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Contact "%" does not exist', p_contact_name;
     END IF;
 
     IF p_type NOT IN ('home', 'work', 'mobile') THEN
-        RAISE EXCEPTION 'Invalid phone type "%". Must be home, work, or mobile.', p_type;
+        RAISE EXCEPTION 'Invalid phone type: % (must be home, work, mobile)', p_type;
     END IF;
 
     INSERT INTO phones (contact_id, phone, type)
-    VALUES (v_contact_id, p_phone, p_type);
-
-    RAISE NOTICE 'Phone % (%) added to contact "%".', p_phone, p_type, p_contact_name;
+    VALUES (v_contact_id, p_phone, p_type)
+    ON CONFLICT DO NOTHING;
 END;
 $$;
 
-
--- 2. move_to_group ───────────────────────────────────────────
---    Moves a contact to the specified group, creating the group
---    if it does not already exist.
+-- 3. Move contact to a group – без изменений
 CREATE OR REPLACE PROCEDURE move_to_group(
     p_contact_name VARCHAR,
     p_group_name   VARCHAR
-)
-LANGUAGE plpgsql AS $$
+) LANGUAGE plpgsql AS $$
 DECLARE
+    v_group_id INTEGER;
     v_contact_id INTEGER;
-    v_group_id   INTEGER;
 BEGIN
-    -- Resolve contact
-    SELECT id INTO v_contact_id
-    FROM contacts
-    WHERE LOWER(first_name || COALESCE(' ' || last_name, '')) = LOWER(TRIM(p_contact_name))
-       OR LOWER(first_name) = LOWER(TRIM(p_contact_name))
-    LIMIT 1;
-
-    IF v_contact_id IS NULL THEN
-        RAISE EXCEPTION 'Contact "%" not found.', p_contact_name;
-    END IF;
-
-    -- Upsert group
-    INSERT INTO groups (name)
-    VALUES (p_group_name)
+    INSERT INTO groups (name) VALUES (p_group_name)
     ON CONFLICT (name) DO NOTHING;
 
     SELECT id INTO v_group_id FROM groups WHERE name = p_group_name;
+    SELECT id INTO v_contact_id FROM contacts WHERE name = p_contact_name;
+
+    IF v_contact_id IS NULL THEN
+        RAISE EXCEPTION 'Contact "%" does not exist', p_contact_name;
+    END IF;
 
     UPDATE contacts SET group_id = v_group_id WHERE id = v_contact_id;
-
-    RAISE NOTICE 'Contact "%" moved to group "%".', p_contact_name, p_group_name;
 END;
 $$;
 
-
--- 3. search_contacts ─────────────────────────────────────────
---    Full-field search: first/last name, email, and ALL phones
---    in the phones table.  Returns a result set.
-CREATE OR REPLACE FUNCTION search_contacts(p_query TEXT)
-RETURNS TABLE (
-    id         INTEGER,
-    first_name VARCHAR,
-    last_name  VARCHAR,
-    email      VARCHAR,
-    birthday   DATE,
-    group_name VARCHAR
+-- 4. Paginated contact query – исправлено
+CREATE OR REPLACE FUNCTION get_contacts_paginated(
+    p_limit INT,
+    p_offset INT
 )
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_pattern TEXT := '%' || LOWER(TRIM(p_query)) || '%';
-BEGIN
-    RETURN QUERY
-    SELECT DISTINCT
-        c.id,
-        c.first_name,
-        c.last_name,
-        c.email,
-        c.birthday,
-        g.name AS group_name
-    FROM contacts c
-    LEFT JOIN groups g  ON g.id  = c.group_id
-    LEFT JOIN phones ph ON ph.contact_id = c.id
-    WHERE
-        LOWER(c.first_name)                          LIKE v_pattern
-        OR LOWER(COALESCE(c.last_name,  ''))         LIKE v_pattern
-        OR LOWER(COALESCE(c.email,      ''))         LIKE v_pattern
-        OR LOWER(COALESCE(ph.phone,     ''))         LIKE v_pattern
-    ORDER BY c.first_name, c.last_name;
-END;
-$$;
-CREATE OR REPLACE FUNCTION get_contacts_paginated(p_limit INTEGER, p_offset INTEGER)
-RETURNS TABLE (
+RETURNS TABLE(
     id         INTEGER,
-    first_name VARCHAR,
-    last_name  VARCHAR,
+    name       VARCHAR,
     email      VARCHAR,
     birthday   DATE,
-    group_id   INTEGER,
+    group_name VARCHAR,
+    phones     VARCHAR[],   -- изменено с TEXT[]
     created_at TIMESTAMP
-) 
-LANGUAGE plpgsql AS $$
+) LANGUAGE plpgsql AS $$
 BEGIN
     RETURN QUERY
-    SELECT * FROM contacts
-    ORDER BY first_name, last_name
-    LIMIT p_limit
-    OFFSET p_offset;
+    SELECT c.id, c.name, c.email, c.birthday, g.name,
+           ARRAY_AGG(DISTINCT p.phone) FILTER (WHERE p.phone IS NOT NULL),
+           c.created_at
+    FROM contacts c
+    LEFT JOIN groups g ON c.group_id = g.id
+    LEFT JOIN phones p ON c.id = p.contact_id
+    GROUP BY c.id, g.name, c.created_at
+    ORDER BY c.name
+    LIMIT p_limit OFFSET p_offset;
 END;
 $$;

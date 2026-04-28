@@ -1,60 +1,38 @@
--- ============================================================
--- schema.sql  –  PhoneBook extended schema (TSIS 1)
--- Run once to set up (or upgrade) the database.
--- ============================================================
+-- schema.sql
+-- Drop existing objects in correct order (CASCADE for functions/procedures)
+DROP TABLE IF EXISTS phones CASCADE;
+DROP TABLE IF EXISTS contacts CASCADE;
+DROP TABLE IF EXISTS groups CASCADE;
 
--- 1. Groups / categories ─────────────────────────────────────
-CREATE TABLE IF NOT EXISTS groups (
+DROP FUNCTION IF EXISTS search_contacts(text) CASCADE;
+DROP PROCEDURE IF EXISTS add_phone(varchar, varchar, varchar) CASCADE;
+DROP PROCEDURE IF EXISTS move_to_group(varchar, varchar) CASCADE;
+DROP FUNCTION IF EXISTS get_contacts_paginated(int, int) CASCADE;
+
+-- Groups table
+CREATE TABLE groups (
     id   SERIAL PRIMARY KEY,
     name VARCHAR(50) UNIQUE NOT NULL
 );
 
--- Seed default groups
-INSERT INTO groups (name) VALUES
-    ('Family'), ('Work'), ('Friend'), ('Other')
-ON CONFLICT (name) DO NOTHING;
-
--- 2. Contacts (base table) ───────────────────────────────────
-CREATE TABLE IF NOT EXISTS contacts (
+-- Contacts table (extended)
+CREATE TABLE contacts (
     id         SERIAL PRIMARY KEY,
-    first_name VARCHAR(50)  NOT NULL,
-    last_name  VARCHAR(50),
+    name       VARCHAR(100) UNIQUE NOT NULL,
     email      VARCHAR(100),
     birthday   DATE,
-    group_id   INTEGER REFERENCES groups(id),
-    created_at TIMESTAMP DEFAULT NOW()
+    group_id   INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Add new columns to an existing contacts table (idempotent)
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'contacts' AND column_name = 'email'
-    ) THEN
-        ALTER TABLE contacts ADD COLUMN email VARCHAR(100);
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'contacts' AND column_name = 'birthday'
-    ) THEN
-        ALTER TABLE contacts ADD COLUMN birthday DATE;
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM information_schema.columns
-        WHERE table_name = 'contacts' AND column_name = 'group_id'
-    ) THEN
-        ALTER TABLE contacts ADD COLUMN group_id INTEGER REFERENCES groups(id);
-    END IF;
-END
-$$;
-
--- 3. Phones (1-to-many with contacts) ────────────────────────
-CREATE TABLE IF NOT EXISTS phones (
+-- Phones table (1-to-many)
+CREATE TABLE phones (
     id         SERIAL PRIMARY KEY,
-    contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+    contact_id INTEGER REFERENCES contacts(id) ON DELETE CASCADE,
     phone      VARCHAR(20) NOT NULL,
     type       VARCHAR(10) CHECK (type IN ('home', 'work', 'mobile'))
 );
+
+-- Pre‑load default groups
+INSERT INTO groups (name) VALUES ('Family'), ('Work'), ('Friend'), ('Other')
+ON CONFLICT (name) DO NOTHING;

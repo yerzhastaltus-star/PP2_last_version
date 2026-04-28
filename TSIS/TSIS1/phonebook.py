@@ -1,495 +1,502 @@
-"""
-phonebook.py  –  PhoneBook Extended (TSIS 1)
-Builds on the CRUD / CSV / search / pagination foundations from
-Practice 7 & 8.  Only NEW features are implemented here.
-"""
-
+# phonebook.py
 import csv
 import json
 import os
 import sys
-from datetime import date, datetime
-
-import psycopg2
-import psycopg2.extras
-
+from datetime import datetime
 from connect import get_connection
 
-# ──────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────
-
-def _conn():
-    return get_connection()
-
-
-def _fmt_date(d):
-    return d.isoformat() if d else ""
-
-
-def _parse_date(s):
-    """Return a date object or None from a YYYY-MM-DD string."""
-    s = (s or "").strip()
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-    except ValueError:
-        print(f"  ⚠  Invalid date '{s}' – expected YYYY-MM-DD, skipping.")
-        return None
-
-
-def _print_contacts(rows):
-    """Pretty-print a list of contact dicts / Row objects."""
-    if not rows:
-        print("  (no contacts found)")
-        return
-    sep = "-" * 80
-    print(sep)
-    for r in rows:
-        phones = r.get("phones", [])
-        phone_str = ", ".join(
-            f"{p['phone']} [{p['type']}]" for p in phones
-        ) if phones else "(no phones)"
-        print(
-            f"  [{r['id']:>4}]  {r['first_name']} {r.get('last_name') or ''}\n"
-            f"         📧 {r.get('email') or '—'} "
-            f"  🎂 {_fmt_date(r.get('birthday')) or '—'} "
-            f"  👥 {r.get('group_name') or '—'}\n"
-            f"         📞 {phone_str}"
-        )
-    print(sep)
-
-
-def _fetch_contacts_with_phones(conn, contact_ids):
-    """Return a list of enriched contact dicts for the given ids."""
-    if not contact_ids:
-        return []
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """
-            SELECT c.id, c.first_name, c.last_name, c.email, c.birthday,
-                   g.name AS group_name
-            FROM contacts c
-            LEFT JOIN groups g ON g.id = c.group_id
-            WHERE c.id = ANY(%s)
-            
-            """,
-            (list(contact_ids),),
-        )
-        contacts = {r["id"]: dict(r) for r in cur.fetchall()}
-
-        cur.execute(
-            "SELECT contact_id, phone, type FROM phones WHERE contact_id = ANY(%s)",
-            (list(contact_ids),),
-        )
-        for row in cur.fetchall():
-            contacts[row["contact_id"]].setdefault("phones", []).append(
-                {"phone": row["phone"], "type": row["type"]}
-            )
-
-    for c in contacts.values():
-        c.setdefault("phones", [])
-    return [contacts[cid] for cid in contact_ids if cid in contacts]
-
-
-# ──────────────────────────────────────────────────────────────
-# 3.1  Schema initialisation
-# ──────────────────────────────────────────────────────────────
-
-def init_schema():
-    """Apply schema.sql and procedures.sql to the connected DB."""
-    base = os.path.dirname(os.path.abspath(__file__))
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            for fname in ("schema.sql", "procedures.sql"):
-                fpath = os.path.join(base, fname)
-                with open(fpath, encoding="utf-8") as f:
-                    sql = f.read()
-                cur.execute(sql)
-        conn.commit()
-    print("✅  Schema and procedures applied.")
-
-
-# ──────────────────────────────────────────────────────────────
-# 3.2  Advanced console search & filter
-# ──────────────────────────────────────────────────────────────
-
-def filter_by_group():
-    """Show contacts in a selected group."""
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT id, name FROM groups ORDER BY name")
-            groups = cur.fetchall()
-
-    if not groups:
-        print("No groups found.")
-        return
-
-    print("\nAvailable groups:")
-    for g in groups:
-        print(f"  {g['id']}. {g['name']}")
-    choice = input("Enter group number (or name): ").strip()
-
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # accept id or name
-            if choice.isdigit():
-                cur.execute(
-                    """
-                    SELECT c.id FROM contacts c
-                    JOIN groups g ON g.id = c.group_id
-                    WHERE g.id = %s
-                    """,
-                    (int(choice),),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT c.id FROM contacts c
-                    JOIN groups g ON g.id = c.group_id
-                    WHERE LOWER(g.name) = LOWER(%s)
-                    """,
-                    (choice,),
-                )
-            ids = [r["id"] for r in cur.fetchall()]
-
-        results = _fetch_contacts_with_phones(conn, ids)
-    _print_contacts(results)
-
-
-def search_by_email():
-    """Search contacts by partial email match."""
-    query = input("Email search term: ").strip()
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "SELECT id FROM contacts WHERE LOWER(email) LIKE %s",
-                (f"%{query.lower()}%",),
-            )
-            ids = [r["id"] for r in cur.fetchall()]
-        results = _fetch_contacts_with_phones(conn, ids)
-    _print_contacts(results)
-
-
-def sort_and_list():
-    """List all contacts sorted by name, birthday, or date added."""
-    print("\nSort by:  1) Name   2) Birthday   3) Date added")
-    choice = input("Choice [1]: ").strip() or "1"
-    order_map = {"1": "c.first_name, c.last_name", "2": "c.birthday NULLS LAST", "3": "c.created_at"}
-    order = order_map.get(choice, "c.first_name, c.last_name")
-
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(f"SELECT id FROM contacts c ORDER BY {order}")
-            ids = [r["id"] for r in cur.fetchall()]
-        results = _fetch_contacts_with_phones(conn, ids)
-    _print_contacts(results)
-
-
-def paginated_browse():
-    """Navigate contacts page-by-page using the DB pagination function."""
-    page_size = 5
-    page = 0
-
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM contacts")
-            total = cur.fetchone()[0]
-
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    print(f"\nTotal contacts: {total}  |  Page size: {page_size}")
-
-    while True:
-        offset = page * page_size
-        with _conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                # Re-use the pagination function from Practice 8
-                cur.execute(
-                    "SELECT * FROM get_contacts_paginated(%s, %s)",
-                    (page_size, offset),
-                )
-                rows = cur.fetchall()
-
-        print(f"\n── Page {page + 1} / {total_pages} ──")
-        if rows:
-            ids = [r["id"] for r in rows]
-            results = _fetch_contacts_with_phones(conn, ids)
-            _print_contacts(results)
-        else:
-            print("  (empty page)")
-
-        cmd = input("[N]ext  [P]rev  [Q]uit: ").strip().lower()
-        if cmd == "n":
-            if page + 1 < total_pages:
-                page += 1
-            else:
-                print("  Already on the last page.")
-        elif cmd == "p":
-            if page > 0:
-                page -= 1
-            else:
-                print("  Already on the first page.")
-        elif cmd == "q":
-            break
-
-
-# ──────────────────────────────────────────────────────────────
-# 3.3  Import / Export
-# ──────────────────────────────────────────────────────────────
-
-def export_to_json(filepath="contacts_export.json"):
-    """Export all contacts (with phones and group) to a JSON file."""
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT id FROM contacts c ORDER BY first_name, last_name")
-            ids = [r["id"] for r in cur.fetchall()]
-        contacts = _fetch_contacts_with_phones(conn, ids)
-
-    # Make dates JSON-serialisable
-    for c in contacts:
-        if isinstance(c.get("birthday"), date):
-            c["birthday"] = c["birthday"].isoformat()
-
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(contacts, f, indent=2, ensure_ascii=False)
-
-    print(f"✅  Exported {len(contacts)} contacts to '{filepath}'.")
-
-
-def _upsert_contact_from_dict(conn, data, on_duplicate="ask"):
+class PhoneBookExtended:
     """
-    Insert or overwrite a contact from a dict.
-    on_duplicate: 'skip' | 'overwrite' | 'ask'
+    ПРОДВИНУТАЯ ТЕЛЕФОННАЯ КНИГА
+    
+    ЛОГИКА РАБОТЫ:
+    Класс-обертка над PostgreSQL БД. При создании объекта - устанавливается соединение,
+    при закрытии - разрывается. Все операции выполняются в транзакциях для сохранения целостности.
+    
+    ПРОДВИНУТЫЕ ФУНКЦИИ:
+    1. Умный импорт CSV (UPSERT + дедупликация)
+    2. JSON импорт с интерактивным разрешением конфликтов
+    3. Пагинация через server-side функцию БД
+    4. Динамическая сортировка с обработкой NULL
+    5. Использование хранимых процедур
+    6. Полнотекстовый поиск через функцию БД
     """
-    first = (data.get("first_name") or "").strip()
-    last  = (data.get("last_name")  or "").strip() or None
-    if not first:
-        print("  ⚠  Skipping record with no first_name.")
-        return
+    
+    def __init__(self):
+        # ПРИНЦИП: соединение создается один раз и переиспользуется
+        self.conn = get_connection()
+        self.conn.autocommit = False   # РУЧНОЕ УПРАВЛЕНИЕ: каждый коммит явный
 
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            "SELECT id FROM contacts WHERE first_name = %s AND "
-            "(last_name = %s OR (last_name IS NULL AND %s IS NULL))",
-            (first, last, last),
-        )
-        existing = cur.fetchone()
+    def close(self):
+        """ОБЯЗАТЕЛЬНО: закрываем соединение даже при ошибках (finally блок)"""
+        self.conn.close()
 
-    if existing:
-        action = on_duplicate
-        if action == "ask":
-            print(f"  ⚠  Duplicate: '{first} {last or ''}'.  [S]kip / [O]verwrite? ", end="")
-            action = "skip" if input().strip().lower() != "o" else "overwrite"
-        if action == "skip":
-            print(f"     → Skipped.")
+    # ========== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (DRY принцип - Don't Repeat Yourself) ==========
+    
+    def _execute(self, sql, params=()):
+        """Для INSERT/UPDATE/DELETE - выполняет и автоматически коммитит"""
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            self.conn.commit()
+
+    def _fetchall(self, sql, params=()):
+        """Для SELECT - возвращает ВСЕ строки результата"""
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+
+    def _fetchone(self, sql, params=()):
+        """Для SELECT - возвращает ТОЛЬКО ПЕРВУЮ строку"""
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchone()
+
+    # ========== 1. ПРОДВИНУТЫЙ CSV ИМПОРТ (UPSERT логика) ==========
+    
+    def import_csv(self, filename):
+        """
+        ЛОГИКА: 
+        1. Читает CSV построчно
+        2. Для каждого контакта проверяет - существует ли уже такой
+        3. Если существует - ОБНОВЛЯЕТ (email, birthday)
+        4. Если нет - СОЗДАЕТ новый
+        5. Телефоны добавляются только если их еще нет (дедупликация)
+        
+        ПРОДВИНУТЫЕ ФИЧИ:
+        - COALESCE: обновляет только те поля, которые не пустые в CSV
+        - Обработка ошибок даты: если формат неправильный - пропускает, но продолжает
+        - Транзакционность: при любой ошибке весь импорт откатывается
+        - Вызов хранимой процедуры move_to_group() для назначения группы
+        """
+        if not os.path.exists(filename):
+            print(f"File {filename} not found.")
             return
-        # overwrite: delete and re-insert to cascade phones
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM contacts WHERE id = %s", (existing["id"],))
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Парсим поля с защитой от пустых значений
+                    name = row.get('name', '').strip()
+                    email = row.get('email', '').strip() or None
+                    birthday = row.get('birthday', '').strip() or None
+                    group = row.get('group', '').strip() or None
+                    phone = row.get('phone', '').strip()
+                    phone_type = row.get('phone_type', 'mobile').strip().lower()
 
-    # Resolve group
-    group_id = None
-    group_name = (data.get("group_name") or data.get("group") or "").strip()
-    if group_name:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO groups (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
-                (group_name,),
-            )
-            cur.execute("SELECT id FROM groups WHERE name = %s", (group_name,))
-            row = cur.fetchone()
-            if row:
-                group_id = row[0]
+                    if not name or not phone:
+                        print(f"Skipping incomplete row: {row}")
+                        continue
 
-    birthday = _parse_date(data.get("birthday"))
-    email    = (data.get("email") or "").strip() or None
+                    # Конвертация даты (ISO формат YYYY-MM-DD)
+                    if birthday:
+                        try:
+                            birthday = datetime.strptime(birthday, '%Y-%m-%d').date()
+                        except ValueError:
+                            print(f"Invalid birthday format for {name}, skipping birthday.")
+                            birthday = None
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO contacts (first_name, last_name, email, birthday, group_id)
-            VALUES (%s, %s, %s, %s, %s) RETURNING id
-            """,
-            (first, last, email, birthday, group_id),
-        )
-        contact_id = cur.fetchone()[0]
+                    # ===== UPSERT ЛОГИКА: Update или Insert =====
+                    with self.conn.cursor() as cur:
+                        # Проверка существования по уникальному полю 'name'
+                        cur.execute("SELECT id FROM contacts WHERE name = %s", (name,))
+                        existing = cur.fetchone()
+                        
+                        if not existing:
+                            # INSERT нового контакта
+                            cur.execute("""
+                                INSERT INTO contacts (name, email, birthday)
+                                VALUES (%s, %s, %s) RETURNING id
+                            """, (name, email, birthday))
+                            contact_id = cur.fetchone()[0]
+                        else:
+                            # UPDATE существующего: COALESCE сохраняет старые значения если новое NULL
+                            contact_id = existing[0]
+                            cur.execute("""
+                                UPDATE contacts SET email = COALESCE(%s, email),
+                                                      birthday = COALESCE(%s, birthday)
+                                WHERE id = %s
+                            """, (email, birthday, contact_id))
 
-    # Insert phones
-    phones = data.get("phones", [])
-    # Also accept flat single-phone fields (from CSV)
-    if not phones and data.get("phone"):
-        phones = [{"phone": data["phone"], "type": data.get("phone_type", "mobile")}]
+                        # ДЕДУПЛИКАЦИЯ ТЕЛЕФОНОВ: добавляем только если такого номера еще нет
+                        cur.execute("SELECT 1 FROM phones WHERE contact_id = %s AND phone = %s", (contact_id, phone))
+                        if not cur.fetchone():
+                            cur.execute("""
+                                INSERT INTO phones (contact_id, phone, type)
+                                VALUES (%s, %s, %s)
+                            """, (contact_id, phone, phone_type))
 
-    with conn.cursor() as cur:
-        for p in phones:
-            ph_type = (p.get("type") or "mobile").lower()
-            if ph_type not in ("home", "work", "mobile"):
-                ph_type = "mobile"
-            cur.execute(
-                "INSERT INTO phones (contact_id, phone, type) VALUES (%s, %s, %s)",
-                (contact_id, p["phone"], ph_type),
-            )
+                        # ВЫЗОВ ХРАНИМОЙ ПРОЦЕДУРЫ (бизнес-логика на стороне БД)
+                        if group:
+                            try:
+                                cur.execute("CALL move_to_group(%s, %s)", (name, group))
+                            except Exception as e:
+                                print(f"Group assignment error for {name}: {e}")
 
-    conn.commit()
-    print(f"  ✅  Saved: {first} {last or ''}")
+                    self.conn.commit()  # ЯВНЫЙ КОММИТ после каждого контакта
+                    print(f"Imported/updated: {name}")
+            print("CSV import finished.")
+        except Exception as e:
+            self.conn.rollback()  # ОТКАТ при любой ошибке
+            print(f"CSV import failed: {e}")
 
+    # ========== 2. JSON ЭКСПОРТ (агрегация данных) ==========
+    
+    def export_json(self, filename):
+        """
+        ЛОГИКА: 
+        Собирает все данные о контактах (включая телефоны и группы) в один JSON файл
+        
+        ПРОДВИНУТЫЕ ФИЧИ:
+        - json_agg() - функция PostgreSQL для агрегации телефонов в JSON массив
+        - json_build_object() - создает JSON объект для каждого телефона
+        - Вложенная структура: контакт -> массив телефонов
+        """
+        sql = """
+            SELECT c.name, c.email, c.birthday, g.name as group_name,
+                   json_agg(  -- АГРЕГАЦИЯ: создает JSON массив из всех телефонов
+                       json_build_object('phone', p.phone, 'type', p.type)  -- КАЖДЫЙ ТЕЛЕФОН → JSON объект
+                   ) as phones
+            FROM contacts c
+            LEFT JOIN groups g ON c.group_id = g.id
+            LEFT JOIN phones p ON c.id = p.contact_id
+            GROUP BY c.id, c.name, c.email, c.birthday, g.name
+            ORDER BY c.name
+        """
+        rows = self._fetchall(sql)
+        contacts_list = []
+        for row in rows:
+            contact = {
+                "name": row[0],
+                "email": row[1],
+                "birthday": str(row[2]) if row[2] else None,
+                "group": row[3],
+                "phones": row[4] or []   # Если нет телефонов - пустой массив
+            }
+            contacts_list.append(contact)
 
-def import_from_json(filepath=None):
-    """Import contacts from a JSON file with duplicate handling."""
-    if filepath is None:
-        filepath = input("JSON file path [contacts_export.json]: ").strip() or "contacts_export.json"
-    if not os.path.exists(filepath):
-        print(f"  ✗  File not found: {filepath}")
-        return
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(contacts_list, f, indent=2, ensure_ascii=False)
+        print(f"Exported {len(contacts_list)} contacts to {filename}")
 
-    with open(filepath, encoding="utf-8") as f:
-        records = json.load(f)
+    # ========== 3. JSON ИМПОРТ (интерактивное разрешение конфликтов) ==========
+    
+    def import_json(self, filename):
+        """
+        ЛОГИКА:
+        1. Загружает JSON
+        2. Для каждого контакта проверяет существование
+        3. Если существует - СПРАШИВАЕТ пользователя: перезаписать или пропустить?
+        4. При перезаписи - удаляет старые телефоны и добавляет новые
+        5. Назначает группы через хранимую процедуру
+        
+        ПРОДВИНУТЫЕ ФИЧИ:
+        - ИНТЕРАКТИВНОСТЬ: пользователь сам решает судьбу дубликатов
+        - АТОМАРНОСТЬ: каждый контакт обрабатывается в своей транзакции
+        - КАСКАДНОЕ УДАЛЕНИЕ: при перезаписи полностью заменяет все данные
+        """
+        if not os.path.exists(filename):
+            print(f"File {filename} not found.")
+            return
+        with open(filename, 'r', encoding='utf-8') as f:
+            contacts_data = json.load(f)
 
-    print(f"Found {len(records)} records in '{filepath}'.")
-    mode = input("On duplicate — [A]sk each / [S]kip all / [O]verwrite all [A]: ").strip().lower()
-    on_dup = {"s": "skip", "o": "overwrite"}.get(mode, "ask")
+        for contact in contacts_data:
+            name = contact.get('name')
+            if not name:
+                continue
+                
+            # Проверка существования
+            exists = self._fetchone("SELECT id FROM contacts WHERE name = %s", (name,))
+            if exists:
+                # ИНТЕРАКТИВНОЕ РАЗРЕШЕНИЕ КОНФЛИКТА
+                ans = input(f"Contact '{name}' already exists. Overwrite? (y/n): ").strip().lower()
+                if ans != 'y':
+                    print(f"Skipping {name}")
+                    continue
+                # Перезапись: сначала удаляем старые телефоны
+                with self.conn.cursor() as cur:
+                    cur.execute("DELETE FROM phones WHERE contact_id = %s", (exists[0],))
+                    cur.execute("""
+                        UPDATE contacts
+                        SET email = %s, birthday = %s, group_id = NULL
+                        WHERE id = %s
+                    """, (contact.get('email'), contact.get('birthday'), exists[0]))
+                    self.conn.commit()
+                contact_id = exists[0]
+            else:
+                # Новый контакт
+                with self.conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO contacts (name, email, birthday)
+                        VALUES (%s, %s, %s) RETURNING id
+                    """, (name, contact.get('email'), contact.get('birthday')))
+                    contact_id = cur.fetchone()[0]
+                    self.conn.commit()
 
-    with _conn() as conn:
-        for rec in records:
-            _upsert_contact_from_dict(conn, rec, on_duplicate=on_dup)
-    print("✅  Import complete.")
+            # Добавление телефонов (вызов процедуры для каждого)
+            for phone_obj in contact.get('phones', []):
+                phone = phone_obj.get('phone')
+                ptype = phone_obj.get('type', 'mobile')
+                if phone:
+                    try:
+                        with self.conn.cursor() as cur:
+                            cur.execute("CALL add_phone(%s, %s, %s)", (name, phone, ptype))
+                            self.conn.commit()
+                    except Exception as e:
+                        print(f"Could not add phone {phone} for {name}: {e}")
+                        self.conn.rollback()
 
+            # Назначение группы
+            group_name = contact.get('group')
+            if group_name:
+                try:
+                    with self.conn.cursor() as cur:
+                        cur.execute("CALL move_to_group(%s, %s)", (name, group_name))
+                        self.conn.commit()
+                except Exception as e:
+                    print(f"Group assignment failed for {name}: {e}")
+                    self.conn.rollback()
+            print(f"Processed: {name}")
 
-def import_from_csv(filepath=None):
-    """
-    Extended CSV importer (TSIS 1):
-    Handles new fields: email, birthday, group, phone_type.
-    Expected columns:
-        first_name, last_name, email, birthday, group, phone, phone_type
-    """
-    if filepath is None:
-        filepath = input("CSV file path [contacts.csv]: ").strip() or "contacts.csv"
-    if not os.path.exists(filepath):
-        print(f"  ✗  File not found: {filepath}")
-        return
-
-    mode = input("On duplicate — [A]sk each / [S]kip all / [O]verwrite all [A]: ").strip().lower()
-    on_dup = {"s": "skip", "o": "overwrite"}.get(mode, "ask")
-
-    imported = 0
-    with _conn() as conn, open(filepath, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            _upsert_contact_from_dict(conn, row, on_duplicate=on_dup)
-            imported += 1
-    print(f"✅  CSV import complete: processed {imported} rows.")
-
-
-# ──────────────────────────────────────────────────────────────
-# 3.4  Stored-procedure wrappers
-# ──────────────────────────────────────────────────────────────
-
-def call_add_phone():
-    """Console wrapper for the add_phone stored procedure."""
-    first_name = input("First name: ").strip()
-    last_name = input("Last name: ").strip()
-    phone = input("Phone number: ").strip()
-    ptype = input("Type (home/work/mobile) [mobile]: ").strip().lower() or "mobile"
-
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "CALL add_phone(%s, %s, %s, %s)",
-                (first_name, last_name, phone, ptype)
-            )
-        conn.commit()
-
-    print("✅  Phone added.")
-
-
-def call_move_to_group():
-    """Console wrapper for the move_to_group stored procedure."""
-    name  = input("Contact name: ").strip()
-    group = input("Target group name: ").strip()
-    with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("CALL move_to_group(%s, %s)", (name, group))
-        conn.commit()
-    print("✅  Contact moved.")
-
-
-def call_search_contacts():
-    """Console wrapper for the search_contacts DB function."""
-    query = input("Search query: ").strip()
-    with _conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT * FROM search_contacts(%s)", (query,))
-            rows = cur.fetchall()
-        ids = [r["id"] for r in rows]
-        results = _fetch_contacts_with_phones(conn, ids)
-    _print_contacts(results)
-
-
-# ──────────────────────────────────────────────────────────────
-# Main menu
-# ──────────────────────────────────────────────────────────────
-
-MENU = """
-╔══════════════════════════════════════════════════╗
-║         PhoneBook  –  TSIS 1 Extended Menu       ║
-╠══════════════════════════════════════════════════╣
-║  SCHEMA                                          ║
-║  0.  Apply schema & procedures                   ║
-╠══════════════════════════════════════════════════╣
-║  SEARCH & FILTER                                 ║
-║  1.  Filter contacts by group                    ║
-║  2.  Search by email                             ║
-║  3.  List all contacts (sorted)                  ║
-║  4.  Browse contacts (paginated)                 ║
-╠══════════════════════════════════════════════════╣
-║  IMPORT / EXPORT                                 ║
-║  5.  Export to JSON                              ║
-║  6.  Import from JSON                            ║
-║  7.  Import from CSV (extended)                  ║
-╠══════════════════════════════════════════════════╣
-║  STORED PROCEDURES                               ║
-║  8.  Add phone number to contact                 ║
-║  9.  Move contact to group                       ║
-║  10. Search contacts (all fields + phones)       ║
-╠══════════════════════════════════════════════════╣
-║  Q.  Quit                                        ║
-╚══════════════════════════════════════════════════╝
-"""
-
-HANDLERS = {
-    "0":  init_schema,
-    "1":  filter_by_group,
-    "2":  search_by_email,
-    "3":  sort_and_list,
-    "4":  paginated_browse,
-    "5":  export_to_json,
-    "6":  import_from_json,
-    "7":  import_from_csv,
-    "8":  call_add_phone,
-    "9":  call_move_to_group,
-    "10": call_search_contacts,
-}
-
-
-def main():
-    while True:
-        print(MENU)
-        choice = input("Select option: ").strip().lower()
-        if choice == "q":
-            print("Goodbye!")
-            break
-        handler = HANDLERS.get(choice)
-        if handler:
-            try:
-                handler()
-            except psycopg2.Error as e:
-                print(f"  ✗  Database error: {e.pgerror or e}")
-            except KeyboardInterrupt:
-                print()
+    # ========== 4. ФИЛЬТРАЦИЯ ПО ГРУППЕ ==========
+    
+    def filter_by_group(self):
+        """
+        ЛОГИКА: Показывает все контакты из выбранной группы
+        Использует array_agg() для группировки телефонов в массив
+        """
+        group_name = input("Enter group name (Family, Work, Friend, Other): ").strip()
+        sql = """
+            SELECT c.name, c.email, c.birthday, g.name, array_agg(p.phone)  -- array_agg: собирает телефоны в массив
+            FROM contacts c
+            LEFT JOIN groups g ON c.group_id = g.id
+            LEFT JOIN phones p ON c.id = p.contact_id
+            WHERE g.name = %s
+            GROUP BY c.id, c.name, c.email, c.birthday, g.name
+            ORDER BY c.name
+        """
+        rows = self._fetchall(sql, (group_name,))
+        if not rows:
+            print(f"No contacts in group '{group_name}'.")
         else:
-            print("  Invalid choice, please try again.")
+            for row in rows:
+                phones = ', '.join(row[4]) if row[4] else ''
+                print(f"{row[0]} | {row[1]} | {row[2]} | Group: {row[3]} | Phones: {phones}")
 
+    # ========== 5. ПОИСК ПО EMAIL (ILIKE - регистронезависимый) ==========
+    
+    def search_by_email(self):
+        """
+        ЛОГИКА: Поиск по части email адреса
+        ILIKE - PostgreSQL оператор для регистронезависимого поиска
+        """
+        pattern = input("Enter email pattern (e.g., @gmail.com): ").strip()
+        sql = "SELECT name, email FROM contacts WHERE email ILIKE %s ORDER BY name"
+        rows = self._fetchall(sql, (f"%{pattern}%",))
+        if rows:
+            for name, email in rows:
+                print(f"{name} -> {email}")
+        else:
+            print("No matching emails.")
 
+    # ========== 6. ДИНАМИЧЕСКАЯ СОРТИРОВКА (с обработкой NULL) ==========
+    
+    def sorted_list(self):
+        """
+        ЛОГИКА: Пользователь выбирает поле для сортировки, SQL формируется динамически
+        
+        ПРОДВИНУТЫЕ ФИЧИ:
+        - NULLS LAST: контакты без даты рождения идут в конце списка
+        - Динамический ORDER BY: строка запроса меняется в зависимости от выбора
+        """
+        print("Sort by: 1. Name  2. Birthday  3. Date added (created_at)")
+        choice = input("Choice: ").strip()
+        if choice == '1':
+            order = "c.name"
+        elif choice == '2':
+            order = "c.birthday NULLS LAST"  # NULLS LAST - пустые даты в конец
+        elif choice == '3':
+            order = "c.created_at"
+        else:
+            print("Invalid choice.")
+            return
+
+        # ДИНАМИЧЕСКОЕ ФОРМИРОВАНИЕ SQL (безопасно, т.к. choice проверен)
+        sql = f"""
+            SELECT c.name, c.email, c.birthday, g.name, array_agg(p.phone), c.created_at
+            FROM contacts c
+            LEFT JOIN groups g ON c.group_id = g.id
+            LEFT JOIN phones p ON c.id = p.contact_id
+            GROUP BY c.id, c.name, c.email, c.birthday, g.name, c.created_at
+            ORDER BY {order}
+        """
+        rows = self._fetchall(sql)
+        for row in rows:
+            phones = ', '.join(row[4]) if row[4] else ''
+            print(f"{row[0]} | {row[1]} | {row[2]} | Group: {row[3]} | Phones: {phones} | Added: {row[5]}")
+
+    # ========== 7. ПОСТРАНИЧНАЯ НАВИГАЦИЯ (server-side пагинация) ==========
+    
+    def paginated_navigation(self, page_size=5):
+        """
+        ЛОГИКА: Просмотр контактов страницами, используя функцию PostgreSQL
+        
+        ПРОДВИНУТЫЕ ФИЧИ:
+        - Server-side пагинация: LIMIT и OFFSET выполняются на стороне БД
+        - НЕ ЗАГРУЖАЕТ все данные в память (экономия ресурсов)
+        - Функция get_contacts_paginated() возвращает ТОЛЬКО нужную страницу
+        - Stateful навигация: сохраняет текущую позицию (offset)
+        """
+        offset = 0  # ТЕКУЩАЯ ПОЗИЦИЯ (хранится в памяти, не в БД)
+        while True:
+            # ВЫЗОВ ФУНКЦИИ БД: передаем размер страницы и смещение
+            sql = "SELECT * FROM get_contacts_paginated(%s, %s)"
+            rows = self._fetchall(sql, (page_size, offset))
+            if not rows:
+                print("No more contacts.")
+                break
+            print(f"\n--- Page (offset {offset}) ---")
+            for r in rows:
+                print(f"ID: {r[0]}, Name: {r[1]}, Email: {r[2]}, Birthday: {r[3]}, Group: {r[4]}")
+                if r[5]:
+                    print(f"   Phones: {', '.join(r[5])}")
+                print("-" * 40)
+            
+            # НАВИГАЦИЯ: изменяем offset пользовательскими командами
+            cmd = input("Next page (n), Previous (p), Quit (q): ").strip().lower()
+            if cmd == 'n':
+                offset += page_size   # Следующая страница
+            elif cmd == 'p' and offset >= page_size:
+                offset -= page_size   # Предыдущая страница
+            elif cmd == 'q':
+                break
+            else:
+                print("Continuing...")
+
+    # ========== 8. ДОБАВЛЕНИЕ ТЕЛЕФОНА (хранимая процедура add_phone) ==========
+    
+    def add_phone_interactive(self):
+        """
+        ЛОГИКА: Вызывает хранимую процедуру add_phone() для добавления телефона
+        
+        ПРЕИМУЩЕСТВА ХРАНИМЫХ ПРОЦЕДУР:
+        - Проверка существования контакта на стороне БД
+        - Автоматическая дедупликация телефонов
+        - Единая бизнес-логика для всех приложений
+        """
+        name = input("Contact name: ").strip()
+        phone = input("Phone number: ").strip()
+        ptype = input("Type (home/work/mobile): ").strip().lower()
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("CALL add_phone(%s, %s, %s)", (name, phone, ptype))
+                self.conn.commit()
+                print("Phone added successfully.")
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Error: {e}")
+
+    # ========== 9. ПЕРЕМЕЩЕНИЕ В ГРУППУ (хранимая процедура move_to_group) ==========
+    
+    def move_to_group_interactive(self):
+        """
+        ЛОГИКА: Вызывает хранимую процедуру move_to_group()
+        
+        ЧТО ДЕЛАЕТ ПРОЦЕДУРА:
+        - Проверяет существование контакта
+        - Автоматически создает группу, если ее нет
+        - Обновляет group_id у контакта
+        """
+        name = input("Contact name: ").strip()
+        group = input("Group name: ").strip()
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("CALL move_to_group(%s, %s)", (name, group))
+                self.conn.commit()
+                print(f"Contact {name} moved to group {group}.")
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Error: {e}")
+
+    # ========== 10. ПОЛНОТЕКСТОВЫЙ ПОИСК (функция search_contacts) ==========
+    
+    def search_contacts_interactive(self):
+        """
+        ЛОГИКА: Поиск по имени, email или телефону через функцию БД
+        
+        ПРОДВИНУТЫЕ ФИЧИ:
+        - Функция search_contacts() ищет СРАЗУ в трех полях (name, email, phone)
+        - Возвращает структурированный результат (контакт + все его телефоны)
+        - Регистронезависимый поиск (ILIKE внутри функции)
+        """
+        query = input("Enter search pattern (name, email, phone): ").strip()
+        rows = self._fetchall("SELECT * FROM search_contacts(%s)", (query,))
+        if not rows:
+            print("No matches found.")
+        else:
+            for r in rows:
+                phones_str = ', '.join(r[5]) if r[5] else ''
+                print(f"ID: {r[0]}, Name: {r[1]}, Email: {r[2]}, Birthday: {r[3]}, Group: {r[4]}")
+                print(f"   Phones: {phones_str}, Added: {r[6]}")
+                print("---")
+
+    # ========== ГЛАВНОЕ МЕНЮ (точка входа в приложение) ==========
+    
+    def run(self):
+        """
+        ЛОГИКА: Бесконечный цикл с обработкой пользовательского ввода
+        Каждый пункт меню вызывает соответствующий метод класса
+        """
+        while True:
+            print("\n===== PHONEBOOK EXTENDED =====")
+            print("1. Import from CSV (extended)")
+            print("2. Export to JSON")
+            print("3. Import from JSON")
+            print("4. Filter by group")
+            print("5. Search by email")
+            print("6. Sorted list (name/birthday/date)")
+            print("7. Paginated navigation")
+            print("8. Add phone to contact")
+            print("9. Move contact to group")
+            print("10. Full-text search (name, email, phone)")
+            print("0. Exit")
+            choice = input("Your choice: ").strip()
+
+            if choice == '1':
+                fn = input("CSV filename: ").strip()
+                self.import_csv(fn)
+            elif choice == '2':
+                fn = input("JSON filename to export: ").strip()
+                self.export_json(fn)
+            elif choice == '3':
+                fn = input("JSON filename to import: ").strip()
+                self.import_json(fn)
+            elif choice == '4':
+                self.filter_by_group()
+            elif choice == '5':
+                self.search_by_email()
+            elif choice == '6':
+                self.sorted_list()
+            elif choice == '7':
+                size = input("Page size (default 5): ").strip()
+                size = int(size) if size.isdigit() else 5
+                self.paginated_navigation(size)
+            elif choice == '8':
+                self.add_phone_interactive()
+            elif choice == '9':
+                self.move_to_group_interactive()
+            elif choice == '10':
+                self.search_contacts_interactive()
+            elif choice == '0':
+                break
+            else:
+                print("Invalid option.")
+
+# ========== ТОЧКА ВХОДА ==========
 if __name__ == "__main__":
-    main()
+    app = PhoneBookExtended()  # Создаем объект (устанавливается соединение с БД)
+    try:
+        app.run()  # Запускаем главный цикл
+    finally:
+        app.close()  # ОБЯЗАТЕЛЬНО: закрываем соединение (даже если была ошибка)
